@@ -1,24 +1,24 @@
+#!/usr/bin/env python3
 import logging
 import requests
 import time
 import json 
+import argparse
 import subprocess
 from datetime import datetime, timezone
 from typing import Any, List, Dict, Union
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
-architectures = ["linux/amd64","linux/arm64/v8","linux/s390x","linux/ppc64le"]
+architectures = ["amd64","arm64","s390x","ppc64le"]
 
 def get_image_digest_id(pull_spec: str, arch: str) -> Optional[str]:
     """
     Returns the image digestID for a specific architecture using OpenShift CLI.
     """
     command = [
-        "oc", "image", "info", 
-        pull_spec, 
-        "--filter-by-os", arch, 
-        "-o", "json"
+        "skopeo", "inspect", "--raw", 
+        "docker://"+pull_spec
     ]
     logger.debug(f"command={command}")
     try:
@@ -32,7 +32,10 @@ def get_image_digest_id(pull_spec: str, arch: str) -> Optional[str]:
         
         # Convert string output to Python object
         data = json.loads(result.stdout)
-        return data.get('digest')
+        # Find the first item where the architecture matches
+        digest = next((m["digest"] for m in data["manifests"]
+               if m["platform"]["architecture"] == arch), None)
+        return digest
 
     except subprocess.CalledProcessError as e:
         # e.stderr contains the actual error from the 'oc' command
@@ -149,20 +152,40 @@ def get_image_name(pull_spec: str) -> str:
     return pull_spec.split('@')[0].split('/')[-1]
 
 def main():
-   images  = ["registry.stage.redhat.io/xxx/yyy"]
-   total_scanned = 0
-   healthy_image_names = []
-   unhealthy_image_names = []
+    parser = argparse.ArgumentParser(description="Display the image grade.")
+    parser.add_argument("file", help="The image file which contain image list")
+    args = parser.parse_args()
 
-   for pull_spec in images:
+    try:
+        with open(args.file, "r") as f:
+            images = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Missing critical file: {args.file}")
+
+    total_scanned = 0
+    healthy_image_names = []
+    unhealthy_image_names = []
+
+    for pull_spec in images:
        logger.debug(f"image = {pull_spec}")
        image_name = get_image_name(pull_spec)
+       logger.info(f"Checking {image_name}")
        try:
            for arch in architectures:
+               logger.debug(f"Checking {image_name} {arch}")
                digest = get_image_digest_id(pull_spec,arch)
+               if digest is None:
+                   logger.warning(f"Skip {image_name} {arch}")
+                   unhealthy_image_names.append({
+                           "name": image_name,
+                           "grade": "unknown",
+                           "pull_spec": pull_spec,
+                           "architecture": arch,
+                           "vulnerabilities": "unknown",
+                       })
+                   continue
                grades, vuln_href = query_pyxis_freshness(digest)
                grade = get_current_image_health_status(grades)
-               logger.info(f" {image_name} {arch} health grade: {grade}")
 
                total_scanned += 1
                if grade and (grade == "Unknown" or grade > "B"):
@@ -192,14 +215,15 @@ def main():
            logger.warning(f"Failed to check freshness for image: {str(e)}")
            continue
 
-       print("==== Health Images grade ====")
-       for item in healthy_image_names:
-           print(f"{item['grade']} --> {item['name']}:{item['architecture']}")
+    print("==== Health Images ====")
+    for item in healthy_image_names:
+        print(f"{item['grade']} - {item['name']}:{item['architecture']}")
 
-       print("==== Unhealth Images grade ====")
-       for item in unhealthy_image_names:
-           print(f"{item['grade']} --> {item['name']}:{item['architecture']}")
-           #print(f"{item['grade']} --> {item['name']}:{item['architecture']} {item['vulnerabilities']}")
+    print("==== Unhealth Images ====")
+    for item in unhealthy_image_names:
+        print(f"{item['grade']} - {item['name']}:{item['architecture']}")
+        #print(f"{item['grade']} - {item['name']}:{item['architecture']} {item['vulnerabilities']}")
+    print("==== End ==== ")
 
 
 # This check prevents code from running automatically during imports
